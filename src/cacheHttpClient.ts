@@ -1,5 +1,10 @@
 import * as core from "@actions/core";
 import * as fs from "fs";
+import * as crypto from "crypto";
+
+import { tmpdir } from "os";
+import { promisify } from "util";
+import * as path from "path";
 import { BearerCredentialHandler } from "@actions/http-client/auth";
 import { HttpClient, HttpCodes } from "@actions/http-client";
 import {
@@ -116,14 +121,56 @@ async function pipeResponseToStream(
     });
 }
 
+const copyFile = promisify(fs.copyFile);
+const readdir = promisify(fs.readdir);
+const stat = promisify(fs.stat);
+
 export async function downloadCache(
     archiveLocation: string,
     archivePath: string
 ): Promise<void> {
-    const stream = fs.createWriteStream(archivePath);
-    const httpClient = new HttpClient("actions/cache");
-    const downloadResponse = await httpClient.get(archiveLocation);
-    await pipeResponseToStream(downloadResponse, stream);
+    const cacheRoot = tmpdir();
+
+    const hash = crypto.createHash("sha256");
+    hash.update(archiveLocation.split('?', 1)[0]);
+    const cachePath = path.join(cacheRoot, `actions-${hash.digest("hex")}.cache`);
+
+    if (!fs.existsSync(cachePath)) {
+        const stream = fs.createWriteStream(`${cachePath}.part`);
+        const httpClient = new HttpClient("actions/cache");
+        const downloadResponse = await httpClient.get(archiveLocation);
+        await pipeResponseToStream(downloadResponse, stream);
+
+        fs.renameSync(`${cachePath}.part`, cachePath);
+    } else {
+        core.debug(`Cache download hit: ${cachePath}`);
+        const now = new Date();
+        fs.utimesSync(cachePath, now, now);
+    }
+
+    await copyFile(cachePath, archivePath);
+
+    // sweep cache directory
+    // expire files not touched in 7 days
+    const expire = new Date(Date.now() - (7 * 24 * 60 * 60 * 1000));
+
+    const names = await readdir(cacheRoot, {});
+
+    for (const name of names as string[]) {
+        if (/^actions-[0-9a-f]{64}\.cache(?:\.part)?$/.test(name)) {
+            const file = path.join(cacheRoot, name);
+            const stats = await stat(file);
+
+            if (stats.mtime <= expire) {
+                try {
+                    core.debug(`Removing expired cache: ${file}`);
+                    fs.unlinkSync(file);
+                } catch (e) {
+                    core.warning(`Failed to remove expired cache: ${e}`)
+                }
+            }
+        }
+    }
 }
 
 // Reserve Cache

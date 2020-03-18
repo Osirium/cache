@@ -1253,6 +1253,10 @@ var __importStar = (this && this.__importStar) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 const core = __importStar(__webpack_require__(470));
 const fs = __importStar(__webpack_require__(747));
+const crypto = __importStar(__webpack_require__(417));
+const os_1 = __webpack_require__(87);
+const util_1 = __webpack_require__(669);
+const path = __importStar(__webpack_require__(622));
 const auth_1 = __webpack_require__(226);
 const http_client_1 = __webpack_require__(539);
 const utils = __importStar(__webpack_require__(443));
@@ -1334,12 +1338,47 @@ function pipeResponseToStream(response, stream) {
         });
     });
 }
+const copyFile = util_1.promisify(fs.copyFile);
+const readdir = util_1.promisify(fs.readdir);
+const stat = util_1.promisify(fs.stat);
 function downloadCache(archiveLocation, archivePath) {
     return __awaiter(this, void 0, void 0, function* () {
-        const stream = fs.createWriteStream(archivePath);
-        const httpClient = new http_client_1.HttpClient("actions/cache");
-        const downloadResponse = yield httpClient.get(archiveLocation);
-        yield pipeResponseToStream(downloadResponse, stream);
+        const cacheRoot = os_1.tmpdir();
+        const hash = crypto.createHash("sha256");
+        hash.update(archiveLocation.split('?', 1)[0]);
+        const cachePath = path.join(cacheRoot, `actions-${hash.digest("hex")}.cache`);
+        if (!fs.existsSync(cachePath)) {
+            const stream = fs.createWriteStream(`${cachePath}.part`);
+            const httpClient = new http_client_1.HttpClient("actions/cache");
+            const downloadResponse = yield httpClient.get(archiveLocation);
+            yield pipeResponseToStream(downloadResponse, stream);
+            fs.renameSync(`${cachePath}.part`, cachePath);
+        }
+        else {
+            core.debug(`Cache download hit: ${cachePath}`);
+            const now = new Date();
+            fs.utimesSync(cachePath, now, now);
+        }
+        yield copyFile(cachePath, archivePath);
+        // sweep cache directory
+        // expire files not touched in 7 days
+        const expire = new Date(Date.now() - (7 * 24 * 60 * 60 * 1000));
+        const names = yield readdir(cacheRoot, {});
+        for (const name of names) {
+            if (/^actions-[0-9a-f]{64}\.cache(?:\.part)?$/.test(name)) {
+                const file = path.join(cacheRoot, name);
+                const stats = yield stat(file);
+                if (stats.mtime <= expire) {
+                    try {
+                        core.debug(`Removing expired cache: ${file}`);
+                        fs.unlinkSync(file);
+                    }
+                    catch (e) {
+                        core.warning(`Failed to remove expired cache: ${e}`);
+                    }
+                }
+            }
+        }
     });
 }
 exports.downloadCache = downloadCache;
